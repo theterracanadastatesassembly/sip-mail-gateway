@@ -64,6 +64,23 @@ The licence is intended to prevent the sale or commercial resale of SIP itself w
 
 See `LICENSE.md` for the complete terms once the licence has been finalized.
 
+## Downloading the Receiver on Ubuntu
+
+To download the current generic receiver directly onto an Ubuntu server, run:
+
+```bash
+curl -fL --show-error -o receiver.py https://raw.githubusercontent.com/theterracanadastatesassembly/sip-mail-gateway/main/src/receiver.py
+```
+
+This saves the script as `receiver.py` in the current directory. The command downloads the source only; the receiver still needs to be configured for the Assembly's mail domain, token file and local mail environment before it is run.
+
+If `curl` is not installed, install it first:
+
+```bash
+sudo apt update
+sudo apt install -y curl
+```
+
 ## Project Status
 
 This repository is under development. Source code, installation procedures and documentation will be reviewed before being designated as an official SIP release.
