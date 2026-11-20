@@ -16,7 +16,9 @@ import hmac
 import logging
 import os
 import re
+import stat
 import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -29,6 +31,8 @@ TOKEN_FILE = "/etc/mail-ingress-token"
 MAX_MESSAGE_BYTES = 25 * 1024 * 1024
 SENDMAIL = "/usr/sbin/sendmail"
 SENDMAIL_TIMEOUT_SECONDS = 30
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_CONCURRENT_CONNECTIONS = 20
 # ----------------------------------------
 
 logging.basicConfig(
@@ -44,7 +48,18 @@ DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 def load_token():
-    token = Path(TOKEN_FILE).read_text(encoding="utf-8").strip()
+    token_path = Path(TOKEN_FILE)
+    try:
+        permissions = stat.S_IMODE(token_path.stat().st_mode)
+    except OSError as exc:
+        raise RuntimeError("Cannot access ingress token file") from exc
+
+    if permissions & 0o077:
+        raise RuntimeError(
+            "Ingress token file is accessible by group or others; set permissions to 600"
+        )
+
+    token = token_path.read_text(encoding="utf-8").strip()
     if len(token) < 32:
         raise RuntimeError("Ingress token is too short; use a long random secret")
     return token
@@ -78,7 +93,11 @@ def valid_email_address(address, allow_empty=False):
     local, domain = address.rsplit("@", 1)
     if not LOCAL_PART_RE.fullmatch(local):
         return False
-    if local.startswith(".") or local.endswith(".") or ".." in local:
+    if (
+        local.startswith((".", "-"))
+        or local.endswith(".")
+        or ".." in local
+    ):
         return False
     return valid_domain(domain)
 
@@ -93,6 +112,12 @@ def recipient_is_allowed(address):
 class Handler(BaseHTTPRequestHandler):
     server_version = "MailIngress"
     sys_version = ""
+
+    def setup(self):
+        super().setup()
+        # Socket inactivity timeout applies while reading the request line,
+        # headers and message body, preventing indefinitely stalled clients.
+        self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
 
     def log_message(self, fmt, *args):
         # Avoid default access logs that can contain sensitive query strings.
@@ -209,9 +234,39 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(202, "Accepted for local mail processing")
 
 
+class LimitedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with a fixed cap on active client connections."""
+
+    daemon_threads = True
+    request_queue_size = MAX_CONCURRENT_CONNECTIONS
+
+    def __init__(self, server_address, request_handler):
+        self.connection_slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_CONNECTIONS
+        )
+        super().__init__(server_address, request_handler)
+
+    def process_request(self, request, client_address):
+        if not self.connection_slots.acquire(blocking=False):
+            LOG.warning("Connection limit reached; rejecting client")
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
+
+
 if __name__ == "__main__":
     LOG.info("Starting receiver on %s:%s", LISTEN_HOST, LISTEN_PORT)
-    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    server = LimitedThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
